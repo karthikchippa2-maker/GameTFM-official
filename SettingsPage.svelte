@@ -1,0 +1,347 @@
+export const chat = $state({
+  authUsername: null,
+  isAdmin: false,
+  avatarUrl: null,
+  connected: false,
+  checkedAuth: false,
+  disabled: false,
+  channels: [],
+  activeChannelId: null,
+  channelMessages: {},
+  bannedUsers: [],
+  reports: [],
+  members: [],
+  roles: [],
+  roleOrder: [],
+  channelHasMore: {},
+  channelLoadingMore: {},
+  channelError: null,
+  timeoutUntil: null,
+  timeoutNotice: null,
+});
+
+let timeoutClearHandle;
+
+// The gate (chat.timeoutUntil) has to clear itself once the timeout expires,
+// or the composer would stay disabled until the next unrelated state change.
+function scheduleTimeoutClear(until) {
+  clearTimeout(timeoutClearHandle);
+  const ms = until - Date.now();
+  if (ms <= 0) {
+    chat.timeoutUntil = null;
+    return;
+  }
+  timeoutClearHandle = setTimeout(() => (chat.timeoutUntil = null), ms);
+}
+
+const PAGE_SIZE = 50;
+export const MAX_MESSAGE_LENGTH = 500; // kept in sync with server/chat.js's MAX_BODY_LENGTH
+
+let socket = null;
+
+async function request(path, { method = "GET", json, formData } = {}) {
+  const headers = {};
+  let body;
+  if (json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(json);
+  } else if (formData) {
+    body = formData;
+  }
+
+  const response = await fetch(`/chat/api/${path}`, { method, headers, credentials: "same-origin", body });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error ?? "request_failed");
+  return data;
+}
+
+export async function checkAuth() {
+  try {
+    const data = await request("me");
+    chat.authUsername = data.username;
+    chat.isAdmin = !!data.isAdmin;
+    chat.avatarUrl = data.avatarUrl ?? null;
+    chat.roles = data.roles ?? [];
+    chat.roleOrder = data.roleOrder ?? [];
+    if (data.timeoutUntil) {
+      chat.timeoutUntil = data.timeoutUntil;
+      scheduleTimeoutClear(data.timeoutUntil);
+    }
+  } catch (err) {
+    if (err.message === "chat_disabled") chat.disabled = true;
+  } finally {
+    chat.checkedAuth = true;
+  }
+  if (chat.authUsername) {
+    connect();
+    fetchChannels();
+    fetchMembers();
+    if (chat.isAdmin) {
+      fetchBannedUsers();
+      fetchReports();
+    }
+  }
+}
+
+export async function signup(username, password, agreedToLegal) {
+  await request("signup", { method: "POST", json: { username, password, agreedToLegal } });
+  await checkAuth();
+}
+
+export async function login(username, password) {
+  await request("login", { method: "POST", json: { username, password } });
+  await checkAuth();
+}
+
+export async function logout() {
+  await request("logout", { method: "POST" });
+  chat.authUsername = null;
+  chat.isAdmin = false;
+  chat.avatarUrl = null;
+  chat.channels = [];
+  chat.activeChannelId = null;
+  chat.channelMessages = {};
+  chat.bannedUsers = [];
+  chat.members = [];
+  chat.roles = [];
+  chat.roleOrder = [];
+  chat.channelHasMore = {};
+  chat.channelLoadingMore = {};
+  chat.reports = [];
+  chat.timeoutUntil = null;
+  chat.timeoutNotice = null;
+  clearTimeout(timeoutClearHandle);
+  disconnect();
+}
+
+export async function uploadAvatar(file) {
+  const formData = new FormData();
+  formData.append("avatar", file);
+  const data = await request("avatar", { method: "POST", formData });
+  chat.avatarUrl = data.avatarUrl;
+}
+
+export async function fetchChannels() {
+  const data = await request("channels");
+  chat.channels = data.channels;
+  if (!chat.activeChannelId && data.channels.length) switchChannel(data.channels[0].id);
+}
+
+export async function fetchMembers() {
+  const data = await request("members");
+  chat.members = data.members;
+}
+
+export function switchChannel(id) {
+  chat.activeChannelId = id;
+  chat.channelError = null;
+  if (!chat.channelMessages[id]) send({ type: "history", channelId: id });
+}
+
+export function loadOlderMessages(channelId) {
+  if (chat.channelLoadingMore[channelId] || chat.channelHasMore[channelId] === false) return;
+
+  const oldest = chat.channelMessages[channelId]?.[0];
+  if (!oldest) return;
+
+  chat.channelLoadingMore[channelId] = true;
+  send({ type: "olderMessages", channelId, beforeId: oldest.id });
+}
+
+export function sendMessage(body) {
+  if (!body.trim()) return;
+  if (chat.activeChannelId) send({ type: "message", channelId: chat.activeChannelId, body });
+}
+
+export function createChannel(name) {
+  return request("admin/channels", { method: "POST", json: { name } });
+}
+
+export function deleteChannel(id) {
+  return request(`admin/channels/${id}`, { method: "DELETE" });
+}
+
+export function clearChannel(id) {
+  return request(`admin/channels/${id}/clear`, { method: "POST" });
+}
+
+export function deleteMessage(id) {
+  return request(`admin/messages/${id}/delete`, { method: "POST" });
+}
+
+export function pinMessage(id) {
+  return request(`admin/messages/${id}/pin`, { method: "POST" });
+}
+
+export function unpinMessage(id) {
+  return request(`admin/messages/${id}/unpin`, { method: "POST" });
+}
+
+export function renameChannel(id, name) {
+  return request(`admin/channels/${id}/rename`, { method: "POST", json: { name } });
+}
+
+export function moveChannel(id, direction) {
+  return request(`admin/channels/${id}/move`, { method: "POST", json: { direction } });
+}
+
+export function setChannelLocked(id, locked) {
+  return request(`admin/channels/${id}/lock`, { method: "POST", json: { locked } });
+}
+
+export function sendImage(channelId, file, caption) {
+  const formData = new FormData();
+  formData.append("image", file);
+  formData.append("body", caption ?? "");
+  return request(`channels/${channelId}/image`, { method: "POST", formData });
+}
+
+export function fetchUserProfile(username) {
+  return request(`users/${encodeURIComponent(username)}`);
+}
+
+export async function updateBio(bio) {
+  return request("me/bio", { method: "POST", json: { bio } });
+}
+
+export function banUser(username) {
+  return request("admin/ban", { method: "POST", json: { username } });
+}
+
+export function unbanUser(username) {
+  return request("admin/unban", { method: "POST", json: { username } });
+}
+
+export function timeoutUser(username, minutes, message) {
+  return request("admin/timeout", { method: "POST", json: { username, minutes, message } });
+}
+
+export function untimeoutUser(username) {
+  return request("admin/untimeout", { method: "POST", json: { username } });
+}
+
+export async function fetchBannedUsers() {
+  const data = await request("admin/banned");
+  chat.bannedUsers = data.users;
+}
+
+export function reportUser(username, reason) {
+  return request("reports", { method: "POST", json: { type: "user", username, reason } });
+}
+
+export function reportMessage(username, messageId, reason) {
+  return request("reports", { method: "POST", json: { type: "message", username, messageId, reason } });
+}
+
+export async function fetchReports() {
+  const data = await request("admin/reports");
+  chat.reports = data.reports;
+}
+
+export async function clearReport(id) {
+  await request(`admin/reports/${id}/clear`, { method: "POST" });
+  chat.reports = chat.reports.filter((report) => report.id !== id);
+}
+
+// The socket takes a moment to open, but callers (e.g. switchChannel on the
+// very first load) don't wait for it — queue and flush on open rather than
+// silently dropping whatever was sent during that window.
+let sendQueue = [];
+
+function send(payload) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+  else sendQueue.push(payload);
+}
+
+export function connect() {
+  if (socket) return;
+
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${protocol}://${location.host}/chat/ws`);
+
+  socket.onopen = () => {
+    chat.connected = true;
+    for (const payload of sendQueue) socket.send(JSON.stringify(payload));
+    sendQueue = [];
+  };
+  socket.onclose = () => {
+    chat.connected = false;
+    socket = null;
+  };
+  socket.onmessage = (event) => handleMessage(JSON.parse(event.data));
+}
+
+export function disconnect() {
+  socket?.close();
+  socket = null;
+  sendQueue = [];
+  chat.connected = false;
+}
+
+function handleMessage(data) {
+  if (data.type === "history") {
+    chat.channelMessages[data.channelId] = data.messages;
+    chat.channelHasMore[data.channelId] = data.messages.length === PAGE_SIZE;
+  } else if (data.type === "message") {
+    (chat.channelMessages[data.channelId] ??= []).push(data);
+  } else if (data.type === "olderMessages") {
+    chat.channelMessages[data.channelId] = [...data.messages, ...(chat.channelMessages[data.channelId] ?? [])];
+    chat.channelHasMore[data.channelId] = data.hasMore;
+    chat.channelLoadingMore[data.channelId] = false;
+  } else if (data.type === "messagePinned" || data.type === "messageUnpinned") {
+    const list = chat.channelMessages[data.channelId];
+    const message = list?.find((m) => m.id === data.id);
+    if (message) message.pinned = data.type === "messagePinned";
+  } else if (data.type === "channelRenamed") {
+    const channel = chat.channels.find((c) => c.id === data.id);
+    if (channel) channel.name = data.name;
+  } else if (data.type === "channelLocked") {
+    const channel = chat.channels.find((c) => c.id === data.id);
+    if (channel) channel.locked = data.locked;
+  } else if (data.type === "channelsReordered") {
+    chat.channels = data.channels;
+  } else if (data.type === "error") {
+    if (data.message === "timed_out") {
+      chat.timeoutUntil = data.until;
+      scheduleTimeoutClear(data.until);
+      chat.channelError = "You're timed out and can't send messages right now.";
+    } else if (data.context === "message" && data.message === "channel_locked") {
+      chat.channelError = "This channel is locked — only admins can post.";
+    } else if (data.context === "message" && data.message === "too_long") {
+      chat.channelError = `Messages can't be longer than ${MAX_MESSAGE_LENGTH} characters.`;
+    } else if (data.context === "message" && data.message === "rate_limited") {
+      chat.channelError = "You're sending messages too fast — slow down a bit.";
+    }
+  } else if (data.type === "channelCreated") {
+    chat.channels.push(data.channel);
+  } else if (data.type === "channelDeleted") {
+    chat.channels = chat.channels.filter((channel) => channel.id !== data.id);
+    delete chat.channelMessages[data.id];
+    if (chat.activeChannelId === data.id) switchChannel(chat.channels[0]?.id ?? null);
+  } else if (data.type === "channelCleared") {
+    if (chat.channelMessages[data.channelId]) chat.channelMessages[data.channelId] = [];
+  } else if (data.type === "messageDeleted") {
+    const list = chat.channelMessages[data.channelId];
+    if (list) chat.channelMessages[data.channelId] = list.filter((message) => message.id !== data.id);
+  } else if (data.type === "userBanned") {
+    for (const id of Object.keys(chat.channelMessages)) {
+      chat.channelMessages[id] = chat.channelMessages[id].filter((m) => m.username !== data.username);
+    }
+    if (chat.isAdmin && !chat.bannedUsers.includes(data.username)) {
+      chat.bannedUsers = [...chat.bannedUsers, data.username];
+    }
+    chat.members = chat.members.filter((member) => member.username !== data.username);
+  } else if (data.type === "userUnbanned") {
+    for (const id of Object.keys(chat.channelMessages)) send({ type: "history", channelId: Number(id) });
+    chat.bannedUsers = chat.bannedUsers.filter((username) => username !== data.username);
+    fetchMembers();
+  } else if (data.type === "timedOut") {
+    chat.timeoutUntil = data.until;
+    chat.timeoutNotice = { until: data.until, message: data.message };
+    scheduleTimeoutClear(data.until);
+  } else if (data.type === "timeoutCleared") {
+    chat.timeoutUntil = null;
+    chat.timeoutNotice = null;
+    clearTimeout(timeoutClearHandle);
+  }
+}
